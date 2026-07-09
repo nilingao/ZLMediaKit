@@ -13,6 +13,8 @@
 #include "RtpServer.h"
 #include "RtpProcess.h"
 #include "Rtcp/RtcpContext.h"
+#include "Rtsp/Rtsp.h"
+#include "RtpSplitter.h"
 #include "Common/config.h"
 
 using namespace std;
@@ -61,6 +63,12 @@ public:
 
     RtpProcess::Ptr getProcess() const { return _process; }
 
+    void clearTcpRtcpSocket(const Socket::Ptr &sock) {
+        if (_rtcp_tcp_sock == sock) {
+            _rtcp_tcp_sock = nullptr;
+        }
+    }
+
     void onRecvRtp(const Socket::Ptr &sock, const Buffer::Ptr &buf, struct sockaddr *addr) {
         try {
             _process->inputRtp(true, sock, buf->data(), buf->size(), addr);
@@ -99,7 +107,44 @@ public:
         });
     }
 
+    void onRecvRtcpTcp(const Socket::Ptr &sock, const char *data, size_t len) {
+        if (!_process) {
+            return;
+        }
+        _rtcp_tcp_sock = sock;
+        uint32_t rtp_ssrc = _ssrc;
+        auto rtcps = RtcpHeader::loadFromBytes((char *)data, len);
+        for (auto &rtcp : rtcps) {
+            if (!rtp_ssrc && (RtcpType)rtcp->pt == RtcpType::RTCP_SR) {
+                rtp_ssrc = ((RtcpSR *)rtcp)->ssrc;
+            }
+            _process->onRtcp(rtcp);
+        }
+        if (rtp_ssrc) {
+            sendRtcp(rtp_ssrc, nullptr);
+        }
+    }
+
 private:
+    void sendRtcpTcp(Buffer::Ptr rtcp) {
+        if (!_rtcp_tcp_sock) {
+            return;
+        }
+        auto size = rtcp->size();
+        if (size > UINT16_MAX) {
+            WarnL << "rtcp packet too large for tcp length header: " << size;
+            return;
+        }
+        auto prefix = BufferRaw::create();
+        prefix->setCapacity(2);
+        prefix->setSize(2);
+        auto ptr = (uint8_t *)prefix->data();
+        ptr[0] = (size >> 8) & 0xFF;
+        ptr[1] = size & 0xFF;
+        _rtcp_tcp_sock->send(std::move(prefix), nullptr, 0, false);
+        _rtcp_tcp_sock->send(std::move(rtcp), nullptr, 0, true);
+    }
+
     void sendRtcp(uint32_t rtp_ssrc, struct sockaddr *addr) {
         // 每5秒发送一次rtcp  [AUTO-TRANSLATED:3c9bcb7b]
         // Send RTCP every 5 seconds
@@ -108,6 +153,15 @@ private:
         }
         _ticker.resetTime();
 
+        auto rtcp = _process->createRtcpRR(rtp_ssrc + 1, rtp_ssrc);
+        if (_rtcp_tcp_sock) {
+            sendRtcpTcp(std::move(rtcp));
+            return;
+        }
+
+        if (!addr) {
+            return;
+        }
         auto rtcp_addr = (struct sockaddr *)_rtcp_addr.get();
         if (!rtcp_addr) {
             // 默认的，rtcp端口为rtp端口+1  [AUTO-TRANSLATED:273d164d]
@@ -120,7 +174,7 @@ private:
             // When no RTCP hole punching packet is received, the default RTCP port is used
             rtcp_addr = addr;
         }
-        _rtcp_sock->send(_process->createRtcpRR(rtp_ssrc + 1, rtp_ssrc), rtcp_addr);
+        _rtcp_sock->send(std::move(rtcp), rtcp_addr);
     }
 
 private:
@@ -128,10 +182,57 @@ private:
     std::function<void()> _timeout_cb;
     Ticker _ticker;
     Socket::Ptr _rtcp_sock;
+    Socket::Ptr _rtcp_tcp_sock;
     RtpProcess::Ptr _process;
     MediaTuple _tuple;
     RtpProcess::onDetachCB _on_detach;
     std::shared_ptr<struct sockaddr_storage> _rtcp_addr;
+};
+
+class RtcpTcpSession : public Session, public RtpSplitter {
+public:
+    RtcpTcpSession(const Socket::Ptr &sock) : Session(sock) {}
+    ~RtcpTcpSession() override = default;
+
+    void setRtcpHelper(RtcpHelper::Ptr helper) { _helper = std::move(helper); }
+
+    void onRecv(const Buffer::Ptr &data) override {
+        // Some devices send raw RTCP on the dedicated TCP RTCP connection; others
+        // use the same two-byte length header as TCP RTP.
+        if (isRtcp(data->data(), data->size())) {
+            onRtpPacket(data->data(), data->size());
+            return;
+        }
+        RtpSplitter::input(data->data(), data->size());
+    }
+
+    void onError(const SockException &err) override {
+        if (auto helper = _helper.lock()) {
+            helper->clearTcpRtcpSocket(getSock());
+        }
+        WarnP(this) << "rtcp tcp session " << err;
+    }
+
+    void onManager() override {
+        if (_helper.expired() && _ticker.createdTime() > 10 * 1000) {
+            shutdown(SockException(Err_timeout, "illegal rtcp connection"));
+        }
+    }
+
+protected:
+    void onRtpPacket(const char *data, size_t len) override {
+        if (!isRtcp(data, len)) {
+            WarnP(this) << "Not rtcp packet";
+            return;
+        }
+        if (auto helper = _helper.lock()) {
+            helper->onRecvRtcpTcp(getSock(), data, len);
+        }
+    }
+
+private:
+    weak_ptr<RtcpHelper> _helper;
+    Ticker _ticker;
 };
 
 void RtpServer::start(uint16_t local_port, const char *local_ip, const MediaTuple &tuple, TcpMode tcp_mode, bool re_use_port, uint32_t ssrc, int only_track, bool multiplex) {
@@ -205,6 +306,7 @@ void RtpServer::start(uint16_t local_port, const char *local_ip, const MediaTupl
     }
 
     TcpServer::Ptr tcp_server;
+    TcpServer::Ptr rtcp_tcp_server;
     if (tcp_mode == PASSIVE || tcp_mode == ACTIVE) {
         auto processor = helper ? helper->getProcess() : nullptr;
         // 如果共享同一个processor对象，那么tcp server声明为单线程模式确保线程安全  [AUTO-TRANSLATED:68bdd877]
@@ -220,6 +322,13 @@ void RtpServer::start(uint16_t local_port, const char *local_ip, const MediaTupl
             tcp_server->start<RtpSession>(local_port, local_ip, 1024, [weak_self, processor](std::shared_ptr<RtpSession> &session) {
                 session->setRtpProcess(processor);
             });
+            if (helper) {
+                // Some GB28181 devices create a second TCP connection for RTCP on RTP port + 1.
+                rtcp_tcp_server = std::make_shared<TcpServer>(poller);
+                rtcp_tcp_server->start<RtcpTcpSession>(local_port + 1, local_ip, 1024, [helper](std::shared_ptr<RtcpTcpSession> &session) {
+                    session->setRtcpHelper(helper);
+                });
+            }
         } else if (tuple.stream.empty()) {
             // tcp主动模式时只能一个端口一个流，必须指定流id; 创建TcpServer对象也仅用于传参  [AUTO-TRANSLATED:61d2a642]
             // In TCP active mode, only one port can have one stream, and the stream ID must be specified; the TcpServer object is created only for parameter passing
@@ -236,6 +345,7 @@ void RtpServer::start(uint16_t local_port, const char *local_ip, const MediaTupl
     };
 
     _tcp_server = tcp_server;
+    _rtcp_tcp_server = rtcp_tcp_server;
     _udp_server = udp_server;
     _rtp_socket = rtp_socket;
     _rtcp_helper = helper;
