@@ -11,6 +11,8 @@ env:
   # Use docker.io for Docker Hub if empty
   REGISTRY: docker.io
   IMAGE_NAME: zlmediakit/zlmediakit
+  DOCKERHUB_USERNAME: zlmediakit
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKER_IO_SECRET }}
 
 jobs:
   build:
@@ -25,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: 下载submodule源码
         run: mv -f .gitmodules_github .gitmodules && git submodule sync && git submodule update --init
@@ -36,27 +38,28 @@ jobs:
         uses: sigstore/cosign-installer@d572c9c13673d2e0a26fabf90b5748f36886883f
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v4
 
 
       # Workaround: https://github.com/docker/build-push-action/issues/461
       - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@79abd3f86f79a9d68a23c75a09a9a85889262adf
+        uses: docker/setup-buildx-action@v4
 
       # Login against a Docker registry except on PR
       # https://github.com/docker/login-action
       - name: Log into registry ${{ env.REGISTRY }}
-        uses: docker/login-action@28218f9b04b4f3f62068d7b6ce6ca5b26e35336c
+        if: ${{ env.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
-          username: zlmediakit
-          password: ${{ secrets.DOCKER_IO_SECRET }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
       # Extract metadata (tags, labels) for Docker
       # https://github.com/docker/metadata-action
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@98669ae865ea3cffbcbaa878cf57c20bbf1c6c38
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
@@ -65,10 +68,10 @@ jobs:
       - name: Build and push Docker image
         if: github.event_name != 'pull_request' && github.ref != 'refs/heads/feature/test'
         id: build-and-push
-        uses: docker/build-push-action@ac9327eae2b366085ac7f6a2d02df8aa8ead720a
+        uses: docker/build-push-action@v7
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && env.DOCKERHUB_TOKEN != '' }}
           tags: ${{ steps.meta.outputs.tags }}_py
           labels: ${{ steps.meta.outputs.labels }}
           build-args: MODEL=Release
