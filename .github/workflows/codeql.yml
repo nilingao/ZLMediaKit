@@ -19,7 +19,7 @@ jobs:
         # Learn more about CodeQL language support at https://aka.ms/codeql-docs/language-support
 
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v7
 
     - name: Initialize CodeQL
       uses: github/codeql-action/init@v2
@@ -39,7 +39,7 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y cmake  libssl-dev libsdl-dev libavcodec-dev libavutil-dev libswscale-dev libresample-dev
 
     - name: 下载 SRTP
-      uses: actions/checkout@v2
+      uses: actions/checkout@v7
       with:
         repository: cisco/libsrtp
         fetch-depth: 1
