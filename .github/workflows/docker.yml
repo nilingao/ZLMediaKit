@@ -10,8 +10,8 @@ on:
 env:
   # Use docker.io for Docker Hub if empty
   REGISTRY: docker.io
-  IMAGE_NAME: zlmediakit/zlmediakit
-  DOCKERHUB_USERNAME: zlmediakit
+  IMAGE_NAME: z84931842/zlmediakit
+  DOCKERHUB_USERNAME: z84931842
   DOCKERHUB_TOKEN: ${{ secrets.DOCKER_IO_SECRET }}
 
 jobs:
